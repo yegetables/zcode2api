@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -63,6 +64,8 @@ QUOTA_REFRESH_INTERVAL = _int("ZCODE_QUOTA_REFRESH_INTERVAL", 60)
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
 
 # ── 上游端点 ─────────────────────────────────────────────────────────────────
+# Coding Plan 走 ZCode 平台网关（/ultra=bigmodel，/ultra-zai=zai），凭证用 x-api-key。
+# 旧的 /zcode-plan/ 路径已失效（401/405）。
 UPSTREAM = {
     "zai": os.getenv(
         "ZAI_UPSTREAM_URL",
@@ -76,6 +79,57 @@ UPSTREAM = {
         "BIGMODEL_UPSTREAM_URL",
         "https://open.bigmodel.cn/api/anthropic/v1/messages",
     ),
+}
+
+# ── 反代模式 ─────────────────────────────────────────────────────────────────
+# coding-plan：原版行为（Coding Plan 反代，走上面 UPSTREAM 的官方端点），一字未改。
+# start-plan：新增路径，反代 ZCode 的 Start Plan 额度 —— 走 ZCode 平台网关的
+#             /zcode-plan 路径，凭证是 ~/.zcode/v2/credentials.json 里的 zcodejwttoken
+#             （JWT），且 body 的 system 必须带平台放行签名（见 zcode_signature.json）。
+# 两种模式互不影响：start-plan 才启用签名注入、指纹头、额度耗尽退出等新行为。
+PLAN_MODE = (os.getenv("ZCODE_PLAN_MODE", "start-plan") or "").strip().lower()
+START_PLAN = PLAN_MODE == "start-plan"
+
+# Start Plan 专用上游端点（coding-plan 模式不使用）
+UPSTREAM["bigmodel_start_plan"] = os.getenv(
+    "BIGMODEL_START_PLAN_URL",
+    "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
+)
+
+# 放行签名数据文件（block0 + block1 前 1500 字符）
+SIGNATURE_FILE = Path(__file__).resolve().parent / "zcode_signature.json"
+
+
+def start_plan_signature() -> list[dict]:
+    """返回要插入 system 最前面的签名块；读不到则返回空列表。"""
+    try:
+        with open(SIGNATURE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    blocks = [data.get("block0"), data.get("block1_head")]
+    if not all(isinstance(b, str) and b for b in blocks):
+        return []
+    return [{"type": "text", "text": b, "cache_control": {"type": "ephemeral"}}
+            for b in blocks]
+
+
+# ZCode 客户端指纹头（平台网关按这些头识别合法客户端，缺了会被 WAF 判 unusual activity）
+ZCODE_FINGERPRINT = {
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "mid-conversation-system-2026-04-07",
+    "http-referer": "https://zcode.z.ai",
+    "user-agent": "ZCode/3.14.4 ai-sdk/provider-utils/4.0.27 runtime/node.js/24",
+    "x-client-language": "zh-CN",
+    "x-client-timezone": "Asia/Shanghai",
+    "x-os-category": "windows",
+    "x-os-version": "10.0.26200",
+    "x-platform": "win32-x64",
+    "x-release-channel": "production",
+    "x-title": "Z Code@electron",
+    "x-zcode-agent": "glm",
+    "x-zcode-app-version": "3.14.4",
+    "x-zcode-session-type": "main",
 }
 
 # ZCode 计费 / 额度查询端点

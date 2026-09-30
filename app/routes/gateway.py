@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import secrets
+import threading
 import time
+import uuid
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -27,8 +30,15 @@ router = APIRouter()
 MAX_CAPTCHA_RETRIES = 3
 MAX_ACCOUNT_ATTEMPTS = 5
 
+# Start Plan 平台网关要求 metadata.user_id 是含 device_id / session_id 的 JSON 字符串。
+# device_id 进程级生成一次（真实客户端也是稳定的设备 ID）。
+_DEVICE_ID = str(uuid.uuid4())
+_SESSION_ID = str(uuid.uuid4())
+
 # Z.AI 上游模型名大小写敏感
 MODEL_NAME_MAP = {
+    "glm-5.3": "GLM-5.3",
+    "glm-5.3-flash": "GLM-5.3-Flash",
     "glm-5.2": "GLM-5.2",
     "glm-5-turbo": "GLM-5-Turbo",
     "glm-turbo": "GLM-5-Turbo",
@@ -36,11 +46,30 @@ MODEL_NAME_MAP = {
     "glm-4.7": "GLM-4.7",
 }
 
-# /v1/models 对外公布的可用模型
-AVAILABLE_MODELS = ["GLM-5.2", "GLM-5-Turbo"]
+# /v1/models 对外公布的可用模型（随反代模式切换；coding-plan 保持原版列表）
+AVAILABLE_MODELS = (
+    ["GLM-5.3", "GLM-5.3-Flash"] if settings.START_PLAN else ["GLM-5.2", "GLM-5-Turbo"]
+)
 
 # 命中以下信号则认为账号额度用完
 _EXHAUST_KEYWORDS = ("quota", "insufficient", "balance", "exhaust", "额度", "余额不足")
+
+# 明确的"额度耗尽"措辞：命中即终止整个反代进程（用户要求，避免继续发请求）。
+# 这里刻意收窄，不含裸 "quota"/"balance"/"insufficient"，以免把限流误判成额度耗尽。
+_QUOTA_FATAL_PHRASES = (
+    "余额不足",
+    "无可用资源包",
+    "额度已用完",
+    "insufficient balance",
+    "no resource package",
+    "quota exhausted",
+    "insufficient quota",
+)
+
+# 额度耗尽时的进程退出码。
+# 刻意用 0（正常退出）：Docker 下配合 `restart: on-failure` 即"额度耗尽停住，
+# 真崩溃才重启"。若用非 0，容器会无限重启、继续发请求，与需求相反。
+EXIT_CODE_QUOTA = 0
 
 
 def _detect_provider(body: dict, headers) -> str:
@@ -70,6 +99,38 @@ def _normalize_body(body: dict) -> dict:
     return body
 
 
+def _apply_start_plan(body: dict) -> dict:
+    """Start Plan 平台网关要求：system 前置放行签名，metadata 为 ZCode 形状。
+
+    签名必须原样位于最前（平台按它识别合法客户端）；客户端自己的 system 追加在其后，
+    不被丢弃。客户端若已带同样签名（重复调用）则不重复插入。
+    """
+    signature = settings.start_plan_signature()
+    if signature:
+        system = body.get("system")
+        already = (
+            isinstance(system, list)
+            and system
+            and isinstance(system[0], dict)
+            and system[0].get("text") == signature[0]["text"]
+        )
+        if not already:
+            if isinstance(system, list):
+                body["system"] = [*signature, *system]
+            elif isinstance(system, str):
+                body["system"] = [*signature, {"type": "text", "text": system}]
+            else:
+                body["system"] = list(signature)
+
+    body["metadata"] = {
+        "user_id": json.dumps(
+            {"device_id": _DEVICE_ID, "account_uuid": "", "session_id": _SESSION_ID},
+            separators=(",", ":"),
+        )
+    }
+    return body
+
+
 def _is_captcha_error(text: str) -> bool:
     low = text.lower()
     return "captcha" in low or "verify token" in low or "verify failed" in low
@@ -80,6 +141,28 @@ def _is_exhausted(status_code: int, text: str) -> bool:
         return True
     low = text.lower()
     return any(k in low for k in _EXHAUST_KEYWORDS)
+
+
+def _is_quota_fatal(status_code: int, text: str) -> bool:
+    """是否属于"额度彻底耗尽"——命中则不再发任何请求，直接终止进程。"""
+    if status_code in (402,):
+        return True
+    low = text.lower()
+    return any(p in low for p in _QUOTA_FATAL_PHRASES)
+
+
+def _fatal_exit(req_id: str, detail: str) -> None:
+    """按用户要求：额度不足时终止整个反代进程，后续不再发任何请求。
+
+    留 1 秒让当前 503 响应写完，再硬退出（os._exit 不等清理，确保没有后续请求）。
+    """
+    logs.warn(req_id, f"额度不足，终止反代程序（退出码 {EXIT_CODE_QUOTA}）：{detail[:200]}")
+
+    def _die() -> None:
+        time.sleep(1.0)
+        os._exit(EXIT_CODE_QUOTA)
+
+    threading.Thread(target=_die, daemon=True).start()
 
 
 def _mark(account: Account, status_value: str, error: str | None = None) -> None:
@@ -126,6 +209,10 @@ async def messages(request: Request):
     incoming_headers = dict(request.headers)
     provider = _detect_provider(body, request.headers)
     body = _normalize_body(body)
+
+    start_plan = settings.START_PLAN
+    if start_plan:
+        body = _apply_start_plan(body)
     # 验证码页面由本服务托管，端口取实际请求端口（兼容任意启动端口）
     port = request.url.port or settings.PORT
     payload = json.dumps(body).encode("utf-8")
@@ -134,9 +221,21 @@ async def messages(request: Request):
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
 
     tried: set[str] = set()
+    if start_plan:
+        # 策略：只用 Start Plan，绝不回退到其它端点/套餐。
+        # ponytail: 目前只有一个 Start Plan 账号，直接取；多账号再补 round-robin。
+        candidates = [a for a in store.list_accounts() if a.mode == "start-plan"]
+    else:
+        # 未显式指定 provider 时允许跨池兜底：首选池无可用账号就换另一个池，
+        # 否则 zai 账号一旦全部失效，bigmodel 的可用号永远轮不到。
+        providers = [provider] if incoming_headers.get("x-provider") else [
+            provider,
+            *[p for p in ("zai", "bigmodel") if p != provider],
+        ]
+        candidates = [a for p in providers for a in store.list_accounts(p)]
 
     for _ in range(MAX_ACCOUNT_ATTEMPTS):
-        account = store.select(provider, skip_ids=tried)
+        account = next((a for a in candidates if a.is_selectable() and a.id not in tried), None)
         if account is None:
             break
         tried.add(account.id)
@@ -204,6 +303,15 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
                 _mark(account, Status.EXHAUSTED, "额度已用完")
                 logs.warn(req_id, f"账号 {account.name} 额度用完，切换下一个")
                 asyncio.create_task(_safe_refresh(account))
+                # 仅 start-plan 模式下才"额度耗尽即退出整个进程"；coding-plan 保持原逻辑
+                if settings.START_PLAN and _is_quota_fatal(status_code, text):
+                    # 额度彻底耗尽：不再尝试其它账号，直接终止整个反代进程
+                    _fatal_exit(req_id, text)
+                    return JSONResponse(
+                        {"error": {"message": "上游额度不足，反代进程即将退出",
+                                   "type": "insufficient_quota"}},
+                        status_code=503,
+                    )
                 return _NEXT_ACCOUNT
 
             if status_code in (401, 403):

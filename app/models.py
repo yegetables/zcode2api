@@ -56,19 +56,27 @@ class Account:
     @staticmethod
     def create(provider: str, name: str, secret: str) -> "Account":
         secret = (secret or "").strip()
-        is_jwt = secret.count(".") == 2 and provider == "zai"
+        # 三个点分段的 JWT：zai 走 Start Plan 的老路径（mode=jwt），
+        # bigmodel 的 Start Plan 走平台网关 /zcode-plan（mode=start-plan）。
+        is_jwt = secret.count(".") == 2
+        if is_jwt and provider == "zai":
+            mode, jwt_token, api_key = "jwt", secret, None
+        elif is_jwt and provider == "bigmodel":
+            mode, jwt_token, api_key = "start-plan", secret, None
+        else:
+            mode, jwt_token, api_key = "apiKey", None, secret
         return Account(
             id=_account_id(name),
             name=name or f"{provider}-account",
             provider=provider,
-            mode="jwt" if is_jwt else "apiKey",
-            jwt_token=secret if is_jwt else None,
-            api_key=None if is_jwt else secret,
+            mode=mode,
+            jwt_token=jwt_token,
+            api_key=api_key,
         )
 
     @property
     def secret(self) -> str | None:
-        return self.jwt_token if self.mode == "jwt" else self.api_key
+        return self.jwt_token if self.mode in ("jwt", "start-plan") else self.api_key
 
     def is_selectable(self, now: float | None = None) -> bool:
         """是否可被轮询选中。"""
