@@ -11,3 +11,9 @@ data_test/
 
 .env
 js-code/
+
+# 提取出的账号凭证（见 launcher/extract-zcode-jwt.cjs）
+zcode-jwt.txt
+
+# 本地运行端口（桌面启动器写入，每台机器不同）
+port.txt
