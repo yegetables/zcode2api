@@ -8,6 +8,8 @@ venv/
 # 运行时数据（账号 SQLite 等）
 data/
 data_test/
+# docker-compose.1panel.yaml 用的数据目录
+zcode2api-data/
 
 .env
 js-code/
