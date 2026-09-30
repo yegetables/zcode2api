@@ -1,0 +1,78 @@
+# zcode2api — 1Panel / fnOS 部署（仓库只保留这个和基础版 docker-compose.yml）
+#
+# 用法：
+#   cp .env.example .env              # 填 ZCODE_SEED_ACCOUNTS 即可
+#   docker compose -f docker-compose.1panel.yaml up -d
+#   docker compose -f docker-compose.1panel.yaml logs -f
+#
+# .env（含 .env.example）由两套 compose 共用；SERVER_PORT 只在本文件里生效。
+#
+# 相对基础版的差异：
+#   1. 网络挂外部 1panel-network，OpenResty 反代按容器名访问 http://zcode2api:3000
+#   2. 宿主机端口默认 12158 → 容器内 3000
+#   3. 数据目录加项目名前缀 zcode2api-data
+#   4. service 名 = 容器名 = zcode2api，不带 dev 后缀
+#   5. 镜像拉本 fork 已发布的 GHCR 镜像（含 Start Plan 路径 / 放行签名修复）
+
+services:
+  zcode2api:
+    image: ghcr.io/yegetables/zcode2api:latest
+    pull_policy: always
+    # 想本地构建就用这两行替换上面两行：
+    # build: .
+    # image: zcode2api:local
+
+    container_name: zcode2api
+    restart: on-failure
+
+    networks:
+      - 1panel-network
+
+    ports:
+      # 冒号右边是容器内固定端口（与下面的 ZCODE_PORT 一致），左边是宿主机端口。
+      # 刻意不加 127.0.0.1: 前缀——留空即绑 0.0.0.0，局域网可直连。
+      - "${SERVER_PORT:-12158}:${ZCODE_PORT:-3000}"
+
+    volumes:
+      # 账号 / 设置持久化：宿主机 ./zcode2api-data ←→ 容器 /data
+      # 迁移自旧目录：mv data zcode2api-data
+      - ./zcode2api-data:/data
+
+    # 让 .env 里所有变量都能进容器（含本文件未列出的）。没有 .env 也能启动。
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # ── 反代模式 ──────────────────────────────────────────────
+      # start-plan（默认）：反代 ZCode Start Plan 额度
+      # coding-plan      ：上游原版行为（Coding Plan 反代）
+      ZCODE_PLAN_MODE: "${ZCODE_PLAN_MODE:-start-plan}"
+
+      # ── 账号 ──────────────────────────────────────────────────
+      # 格式 bigmodel:<zcodejwttoken>；留空则需自行进后台添加
+      ZCODE_SEED_ACCOUNTS: "${ZCODE_SEED_ACCOUNTS:-}"
+
+      # ── 服务 ──────────────────────────────────────────────────
+      ZCODE_HOST: "${ZCODE_HOST:-0.0.0.0}"
+      ZCODE_PORT: "${ZCODE_PORT:-3000}"
+      # 必须与上面挂载的容器路径一致，否则账号不会持久化
+      ZCODE_DATA_DIR: "${ZCODE_DATA_DIR:-/data}"
+      ZCODE_ADMIN_KEY: "${ZCODE_ADMIN_KEY:-zcode}"
+      ZCODE_QUOTA_REFRESH_INTERVAL: "${ZCODE_QUOTA_REFRESH_INTERVAL:-0}"
+      ZCODE_COOLING_SECONDS: "${ZCODE_COOLING_SECONDS:-300}"
+
+      # ── 容器 ──────────────────────────────────────────────────
+      TZ: "${TZ:-Asia/Shanghai}"
+      NO_COLOR: "${NO_COLOR:-1}"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  1panel-network:
+    external: true
+    name: 1panel-network

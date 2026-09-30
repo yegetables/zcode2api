@@ -1,6 +1,6 @@
 # zcode2api 本地部署与使用指南
 
-本文面向**要在本机调用这个网关的其他人和其他项目**：怎么启动、怎么发请求、它到底怎么工作、踩过哪些坑。
+本文面向**部署和调用这个网关的人**：本机怎么起、其他项目怎么调、NAS 上怎么跑，以及它到底怎么工作、踩过哪些坑。
 
 > 只想看「怎么调」→ 直接跳 [快速开始](#快速开始)。
 > 想知道「为什么能通」→ 看 [原理](#原理)。
@@ -12,19 +12,22 @@
 ### 1. 启动服务
 
 ```bash
-cd C:\Users\yegetables\work\zcode2api
+cd <zcode2api 目录>
 python main.py serve
 ```
 
-默认监听 `0.0.0.0:3000`。本机访问用 `http://127.0.0.1:3000`。
+默认监听 `0.0.0.0:3000`。
 
-> 若通过桌面 `ZCode中转服务.bat` 启动，端口以 `zcode2api\port.txt` 为准（当前为 **58171**），
-> 用菜单 `[6] 修改端口` 可改。下面示例里的 3000 请按实际端口替换。
+> 若通过桌面 `launcher\ZCode中转服务.bat` 启动，端口以 `port.txt` 为准（菜单 `[6]` 可改）。
+> 下面示例里的 3000 请按实际端口替换。
 
-**不需要**做的：
+**账号**：网关账号存在 `data/accounts.db`，**该文件不进仓库**。本机已有就直接可用；
+全新 clone 需要先导入一个账号，见 [账号过期 / 凭证失效怎么更新](#账号过期--凭证失效怎么更新)。
 
-- ❌ 不需要 `python main.py login zai` —— 账号已持久化在 `data/accounts.db`
-- ❌ 不需要 `cd captcha_node && npm install` —— 现在走的链路不校验阿里云无痕验证
+**不需要**做的（`start-plan` 模式）：
+
+- ❌ 不需要 `python main.py login zai`
+- ❌ 不需要 `cd captcha_node && npm install` —— `start-plan` 链路不走阿里云无痕验证
 
 ### 2. 确认账号状态
 
@@ -32,7 +35,13 @@ python main.py serve
 python main.py accounts
 ```
 
-期望看到 `start-plan-xxxx  bigmodel  start-plan  active`（这是唯一参与轮询的账号）。
+期望看到类似（5 列：id / provider / mode / 状态 / 名称）：
+
+```
+start-plan-75a568ab  bigmodel  start-plan  active  start-plan
+```
+
+只有 `mode = start-plan` 的账号会参与轮询。
 
 ### 3. 发请求
 
@@ -151,9 +160,7 @@ ZCODE_PLAN_MODE=coding-plan python main.py serve
 
 ### Start Plan 链路（本次改造核心）
 
-旧方案（已废弃）用 `~/.zcode/v2/credentials.json` 里 `individual-coding-plan` 的 API Key 打 `/ultra/` 端点。该 Key 的**充值余额已耗尽**（上游 429「余额不足或无可用资源包」），且平台查询明确返回 `当前用户不存在coding plan`。
-
-现在改走 ZCode 客户端的真实链路 **Start Plan**：
+`coding-plan` 模式那条路（`~/.zcode/v2/credentials.json` 里 `individual-coding-plan` 的 API Key）**余额已耗尽**——上游返回 429「余额不足或无可用资源包」，平台查询也明确返回 `当前用户不存在coding plan`。所以默认改走 ZCode 客户端真正在用的链路 **Start Plan**：
 
 | 要素 | 值 |
 |------|-----|
@@ -263,12 +270,14 @@ node launcher/extract-zcode-jwt.cjs
 | 场景 | 做法 |
 |------|------|
 | **本机 / 桌面启动器** | 打开后台 `http://127.0.0.1:<端口>/admin/login`（默认密码 `zcode`），删掉旧账号、用新 JWT 新建 |
-| **Docker / NAS** | 改 `.env` 的 `ZCODE_SEED_ACCOUNTS="bigmodel:<新JWT>"`，先删旧账号再重建容器 |
+| **Docker / NAS** | 改 `.env` 的 `ZCODE_SEED_ACCOUNTS="bigmodel:<新JWT>"`，**先删旧账号**再重建容器 |
 
-Docker 那条要特别注意：**`.env` 只在首次启动注入**，已入库的账号不会被覆盖。所以顺序是「先删旧账号 → 再 `up --force-recreate`」：
+Docker 那条要特别注意：**`.env` 只在容器首次启动时注入**，已入库的账号不会被覆盖，必须先删旧的。
+账号名由注入时的 provider 决定（默认是 **`seed-bigmodel`**），先确认再删：
 
 ```bash
-docker exec zcode2api python main.py remove-account bigmodel start-plan
+docker exec zcode2api python main.py accounts                     # 看 id / 名称
+docker exec zcode2api python main.py remove-account bigmodel <id或name>
 docker compose -f docker-compose.1panel.yaml up -d --force-recreate
 ```
 
@@ -313,26 +322,119 @@ curl -X POST http://127.0.0.1:<端口>/v1/messages \
 
 | 文件 | 改动 |
 |------|------|
-| `docker-compose.yml` | 注释切换远程镜像 / 本地构建；加 `ZCODE_PLAN_MODE`、`restart: on-failure` |
-| `docker-compose.1panel.yaml` | **新增**：1Panel / fnOS 变体（12158:3000、外部 `1panel-network`） |
-| `.env.1panel.example` | **新增** |
-| `.env.example` | 补充 `ZCODE_PLAN_MODE` 说明 |
+| `docker-compose.yml` | 值全改 `${VAR:-default}` + 可选 `env_file` 读 `.env`（原先硬编码，`.env` 不生效）；注释切换远程镜像 / 本地构建；补 `ZCODE_PLAN_MODE`、`ZCODE_SEED_ACCOUNTS`、`ZCODE_DATA_DIR`、`SERVER_PORT`、`restart: on-failure` |
+| `docker-compose.1panel.yaml` | **新增**：1Panel / fnOS 变体（`SERVER_PORT` 默认 12158、外部 `1panel-network`、数据目录 `zcode2api-data`） |
+| `.env.example` | 重写为 start-plan 开箱即用；**两套 compose 共用一份**（原 `.env.1panel.example` 已合并删除） |
 | `Dockerfile` | 构建时校验放行签名文件存在；更新注释 |
 | `.dockerignore` | 排除 `launcher/` |
 | `app/main.py` | 新增 `_seed_accounts()`：从 `ZCODE_SEED_ACCOUNTS` 注入账号，容器免交互登录 |
 | `app/logs.py` | 支持 `NO_COLOR`，便于 `docker logs` 采集 |
 
-> 账号库 `data/accounts.db` 是运行时数据，**不进仓库**。首次部署用 `.env` 的 `ZCODE_SEED_ACCOUNTS` 注入，或直接 scp 过去。
+> 账号库 `data/accounts.db` 是运行时数据，**不进仓库**（导入方式见上面 NAS 章节）。
 >
 > `coding-plan` 模式的代码（`UPSTREAM`、`agent.py` 的 zai 分支、`_detect_provider`、`captcha.py`）全部保持上游原样，本次未改动。
+
+---
+
+## 部署到 NAS（Docker）
+
+仓库只保留两套 compose：
+
+| 文件 | 场景 |
+|------|------|
+| `docker-compose.yml` | 本机快速试跑（宿主机端口 3000，数据在 `./data`） |
+| `docker-compose.1panel.yaml` | 1Panel / fnOS（外部 `1panel-network`、宿主机端口 12158 → 容器 3000、数据目录 `zcode2api-data`） |
+
+两套都用同一份 `.env`。端口约定：**`SERVER_PORT` = 宿主机端口，`ZCODE_PORT` = 容器内端口**。
+不设 `SERVER_PORT` 时各自用默认（基础版 3000、1panel 版 12158）。想让宿主机 12345 → 容器 3000：
+
+```bash
+# 改 .env（持久）
+SERVER_PORT=12345
+# 或临时覆盖（不改 .env）
+SERVER_PORT=12345 docker compose -f docker-compose.yml up -d
+```
+
+### 步骤（1Panel / fnOS）
+
+```bash
+git clone git@github.com:yegetables/zcode2api.git && cd zcode2api
+
+# 1. 配 env（两套 compose 共用同一个 .env.example）
+cp .env.example .env
+#   编辑 .env，只需填账号：
+#     ZCODE_SEED_ACCOUNTS="bigmodel:<zcodejwttoken>"   # JWT 由桌面端提取
+#   其余保持默认（ZCODE_PLAN_MODE 默认就是 start-plan；宿主机端口由 SERVER_PORT 决定，默认 12158）
+#
+#   不想走 .env 也可以：把本地 data/accounts.db 直接拷到 zcode2api-data/accounts.db
+
+# 2. 启动（直接拉已发布镜像）
+docker compose -f docker-compose.1panel.yaml up -d
+docker compose -f docker-compose.1panel.yaml logs -f
+```
+
+访问 `http://<NAS>:12158`，后台 `http://<NAS>:12158/admin/login`（默认密码 `zcode`）。
+
+镜像已发布：**`ghcr.io/yegetables/zcode2api:latest`**（tag 另有 `sha-<短哈希>`）。NAS 上不需要构建工具链，`docker compose pull` 即可更新。
+
+> 若 GHCR 包是私有的，先 `docker login ghcr.io -u <用户名>` 用带 `read:packages` 的 token 登录。
+> 想本地构建：把 compose 里 `image`/`pull_policy` 两行换成 `build: .`。
+
+### 更新已发布的镜像
+
+`.github/workflows/docker-build.yml` 配的是 **push 到 master 自动构建**，但 fork 仓库的 push 事件有时不触发。
+可手动跑一次，`--ref` 指定要构建的分支：
+
+```bash
+gh workflow run docker-build --ref master     # 构建 master
+gh workflow run docker-build --ref dev        # 构建 dev
+gh run list --limit 3                         # 看状态
+```
+
+> ⚠️ 工作流的 `on.push` 只监听 **master**。代码在 `dev` 时，必须显式 `--ref dev`，
+> 否则构建出来的还是 master 上的旧代码。
+
+NAS 侧更新（镜像 tag 是 `latest`，配了 `pull_policy: always`）：
+
+```bash
+docker compose -f docker-compose.1panel.yaml pull
+docker compose -f docker-compose.1panel.yaml up -d
+```
+
+> 账号只在容器**首次**启动时从 `.env` 注入，之后改 `.env` 不生效——换账号见
+> [账号过期 / 凭证失效怎么更新](#账号过期--凭证失效怎么更新)。
+
+### 为什么 `restart` 是 `on-failure` 而不是 `unless-stopped`
+
+额度耗尽时网关会**主动退出整个进程**（见上文「额度耗尽即终止进程」）。该退出是 `exit 0`：
+
+- `on-failure`：额度耗尽 → 停住不重启；真崩溃 → 非 0 → 自动重启 ✅
+- `unless-stopped` / `always`：额度耗尽 → 反复重启 → 继续打上游 ❌
+
+**别把这一项改成 always**，否则和防封号的初衷相反。
+
+### 反代
+
+1Panel 里用 OpenResty 反代到容器名即可（容器在 `1panel-network` 上）：
+
+```
+http://zcode2api:3000
+```
+
+外部访问用 `http://<NAS>:12158`。
+
+### 镜像说明
+
+`Dockerfile` 是纯 Python（`python:3.13-slim`，约 180MB），无 Node 依赖，x86_64 / arm64 原生可用。`app/zcode_signature.json` 必须打进镜像（放行签名），构建时会校验它存在。
+
+---
 
 ## 已知限制
 
 - **模型可能自称 ZCode**。签名块（ZCode 的身份与行为提示词）必须进 system 才能过 WAF，模型因此可能把自己当成 ZCode。客户端自己的 system 追加在后，通常能覆盖；但对身份敏感的场景要注意。
 - **无 OpenAI 协议**，只有 `/v1/messages`（Anthropic）。
 - **Trust Build 无法显式指定**。截图里的 "ZCode Trust Build" 与 "ZCode Start Plan" 是平台侧同一凭证下的两个配额桶，客户端（源码里零相关字符串）无法选择，由服务端决定扣哪个。网关能做的是只走 Start Plan、不回退。
-- **凭证会轮换**。`zcodejwttoken` 由桌面端维护；若上游开始返回 401，需重新从 `credentials.json` 解密导入。
 - **限流**。见上文「上游限流」。
-- **仅本机可用**。服务监听 `0.0.0.0`，但网关 Key 未设置，暴露到局域网等于无鉴权。要给别的机器用，先在后台配上网关 Key。
+- **网关 Key 默认未设置**。服务监听 `0.0.0.0`，暴露到局域网/公网等于无鉴权。要给别的机器或 NAS 用，先在后台配上网关 Key。
 - **`coding-plan` 模式当前跑不通**。Coding Plan 的 API Key 余额已耗尽（上游 429），且该模式需要阿里云无痕验证。保留它是为了不动上游代码；实际请用 `start-plan`。
 - **`captcha_node/` 只服务 `coding-plan` 模式**，`start-plan` 下不会执行。

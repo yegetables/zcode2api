@@ -27,3 +27,6 @@ venv
 js-code
 .vscode
 .idea
+
+# ── Windows 桌面启动器（与容器无关）──
+launcher

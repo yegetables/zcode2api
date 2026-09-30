@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from contextlib import asynccontextmanager
 
@@ -13,6 +14,7 @@ from . import logs
 from .captcha import captcha_manager
 from .quota import monitor
 from .routes import admin_api, gateway, pages
+from .store import store
 
 # 修正 Windows 中文控制台可能出现的乱码
 for _stream in (sys.stdout, sys.stderr):
@@ -20,6 +22,28 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001
         pass
+
+
+def _seed_accounts() -> None:
+    """从 ZCODE_SEED_ACCOUNTS 注入账号，让容器/NAS 首次启动无需交互式 OAuth。
+
+    格式：逗号分隔的 `provider:secret`，provider 取 zai | bigmodel。
+    store.add_account 会跳过重复 secret，故每次启动重复注入是安全的。
+    """
+    raw = (os.environ.get("ZCODE_SEED_ACCOUNTS") or "").strip()
+    if not raw:
+        return
+    for item in raw.split(","):
+        item = item.strip()
+        provider, _, secret = item.partition(":")
+        provider, secret = provider.strip(), secret.strip()
+        if not secret:
+            continue
+        if provider not in ("zai", "bigmodel"):
+            logs.warn("seed", f"跳过未知 provider: {provider!r}")
+            continue
+        acc = store.add_account(provider, f"seed-{provider}", secret)
+        logs.ok("seed", f"{provider} 账号 {acc.id}（{acc.mode}）")
 
 
 def _display_host() -> str:
@@ -30,6 +54,7 @@ def _display_host() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _seed_accounts()
     monitor.start()
     base = f"http://{_display_host()}:{settings.PORT}"
     logs.banner([

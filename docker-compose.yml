@@ -1,19 +1,55 @@
 services:
   zcode2api:
-    build: .
-    image: zcode2api:latest
+    # ── 镜像二选一 ────────────────────────────────────────────────
+    # A) 拉远程已发布镜像（推荐）
+    image: ghcr.io/yegetables/zcode2api:latest
+    pull_policy: always
+    # B) 本地构建：注释掉上面 A 的两行，放开下面两行
+    # build: .
+    # image: zcode2api:local
+
     container_name: zcode2api
+
     ports:
-      - "3000:3000"
+      # SERVER_PORT：宿主机端口（默认 3000）
+      # ZCODE_PORT ：容器内端口（默认 3000），也是应用监听端口
+      - "${SERVER_PORT:-3000}:${ZCODE_PORT:-3000}"
+
     volumes:
-      # 账号 / 设置持久化到宿主机（容器内为 /data）
+      # 账号 / 设置持久化：宿主机 ./data ←→ 容器 /data
       - ./data:/data
+
+    # 让 .env 里所有变量都能进容器（含本文件未列出的）。没有 .env 也能启动。
+    env_file:
+      - path: .env
+        required: false
+
     environment:
-      # 后台管理密码（首次启动写入 data/accounts.db，之后以数据库为准）
-      ZCODE_ADMIN_KEY: "zcode"
-      # 后台自动刷新各账号额度的间隔（秒），0 关闭
-      ZCODE_QUOTA_REFRESH_INTERVAL: "60"
-      # 单次无痕验证求解超时（秒）/ 失败重试次数
-      ZCODE_CAPTCHA_TIMEOUT: "40"
-      ZCODE_CAPTCHA_RETRIES: "4"
-    restart: unless-stopped
+      # ── 反代模式 ──────────────────────────────────────────────
+      # start-plan（默认）：反代 ZCode Start Plan 额度，普通人用这个
+      # coding-plan      ：上游原版行为（Coding Plan 反代，需 API Key + 无痕验证）
+      ZCODE_PLAN_MODE: "${ZCODE_PLAN_MODE:-start-plan}"
+
+      # ── 账号 ──────────────────────────────────────────────────
+      # 格式 bigmodel:<zcodejwttoken>；留空则容器内无账号，需自行进后台添加
+      ZCODE_SEED_ACCOUNTS: "${ZCODE_SEED_ACCOUNTS:-}"
+
+      # ── 服务 ──────────────────────────────────────────────────
+      ZCODE_HOST: "${ZCODE_HOST:-0.0.0.0}"
+      ZCODE_PORT: "${ZCODE_PORT:-3000}"
+      # 必须与上面挂载的容器路径一致，否则账号不会持久化
+      ZCODE_DATA_DIR: "${ZCODE_DATA_DIR:-/data}"
+      ZCODE_ADMIN_KEY: "${ZCODE_ADMIN_KEY:-zcode}"
+      # 额度监控对新套餐不生效，默认关闭
+      ZCODE_QUOTA_REFRESH_INTERVAL: "${ZCODE_QUOTA_REFRESH_INTERVAL:-0}"
+      # 被上游 429 后的冷却秒数
+      ZCODE_COOLING_SECONDS: "${ZCODE_COOLING_SECONDS:-300}"
+
+      # ── 容器 ──────────────────────────────────────────────────
+      TZ: "${TZ:-Asia/Shanghai}"
+      # 纯文本日志，便于 docker logs 采集
+      NO_COLOR: "${NO_COLOR:-1}"
+
+    # 额度耗尽时进程以 0（正常）退出：on-failure 才能"耗尽停住、真崩溃才重启"。
+    # 改成 unless-stopped/always 会让额度耗尽被反复重启，持续打上游。
+    restart: on-failure
