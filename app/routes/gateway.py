@@ -246,9 +246,28 @@ async def messages(request: Request):
             continue
         return result
 
+    # 暂时不可用（账号限流冷却中）→ 返回 429 + Retry-After，让客户端按限流退避重试；
+    # 真正不可用（额度耗尽 / 凭证失效 / 已停用）才返回 503。
+    now = time.time()
+    cooling = [
+        a.cooling_until
+        for a in store.list_accounts()
+        if a.status == Status.COOLING and a.cooling_until and a.cooling_until > now
+    ]
+    if cooling:
+        retry_after = max(1, int(min(cooling) - now))
+        logs.req_err(req_id, f"账号限流冷却中，{retry_after}s 后重试")
+        return JSONResponse(
+            {"error": {"message": f"上游账号限流（rate limit / too many requests），约 {retry_after} 秒后恢复，请稍后重试",
+                       "type": "rate_limit_error"}},
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+
     logs.req_err(req_id, "无可用账号 / 额度均已耗尽")
     return JSONResponse(
-        {"error": {"message": "所有账号均不可用或额度已用完，请在后台检查账号状态", "type": "no_available_account"}},
+        {"error": {"message": "所有账号均不可用（额度耗尽 / 凭证失效 / 已停用），请在后台检查账号状态",
+                   "type": "no_available_account"}},
         status_code=503,
     )
 
