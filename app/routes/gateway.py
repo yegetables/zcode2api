@@ -165,11 +165,24 @@ def _fatal_exit(req_id: str, detail: str) -> None:
     threading.Thread(target=_die, daemon=True).start()
 
 
-def _mark(account: Account, status_value: str, error: str | None = None) -> None:
+def _retry_after_seconds(resp) -> float | None:
+    """上游 429 的 Retry-After（秒）。缺失/非法返回 None，调用方回退默认冷却。
+
+    # ponytail: 只解析整数秒形式，不解析 HTTP-date；真遇到 date 形式会回退默认值
+    """
+    try:
+        return max(1.0, float(resp.headers.get("retry-after", "")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _mark(
+    account: Account, status_value: str, error: str | None = None, seconds: float | None = None
+) -> None:
     account.status = status_value
     account.last_error = error
     if status_value == Status.COOLING:
-        account.cooling_until = time.time() + settings.COOLING_SECONDS
+        account.cooling_until = time.time() + (seconds or settings.COOLING_SECONDS)
     store.update_account(account)
 
 
@@ -339,8 +352,10 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
                 return _NEXT_ACCOUNT
 
             if status_code == 429:
-                _mark(account, Status.COOLING, "上游限流 429")
-                logs.warn(req_id, f"账号 {account.name} 被限流 429，切换下一个")
+                retry_after = _retry_after_seconds(resp)
+                _mark(account, Status.COOLING, "上游限流 429", seconds=retry_after)
+                extra = f"（按上游 Retry-After 冷却 {int(retry_after)}s）" if retry_after else ""
+                logs.warn(req_id, f"账号 {account.name} 被限流 429{extra}，切换下一个")
                 return _NEXT_ACCOUNT
 
             # 其它错误：直接回传客户端
